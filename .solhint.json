@@ -1,1 +1,9 @@
-
+{
+  "extends": "solhint:recommended",
+  "rules": {
+    "compiler-version": ["error", "^0.8.30"],
+    "func-visibility": ["error", { "ignoreConstructors": false }],
+    "private-vars-leading-underscore": "off",
+    "reason-string": ["warn", { "maxLength": 64 }]
+  }
+}
