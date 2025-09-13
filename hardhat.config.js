@@ -1,9 +1,17 @@
 require("@nomicfoundation/hardhat-toolbox");
 
+/** @type import('hardhat/config').HardhatUserConfig */
 module.exports = {
   solidity: {
     version: "0.8.30",
-    settings: { optimizer: { enabled: true, runs: 200 }, evmVersion: "paris" }
+    settings: {
+      optimizer: { enabled: true, runs: 200 }
+    }
   },
-  mocha: { timeout: 120000 }
+  paths: {
+    sources: "./contracts",
+    tests: "./test",
+    cache: "./cache",
+    artifacts: "./artifacts"
+  }
 };
