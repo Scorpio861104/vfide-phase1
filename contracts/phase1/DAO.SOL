@@ -1,1 +1,953 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.2;
 
+/**
+ * @title VFIDE DAO - ENHANCED GOVERNANCE SYSTEM
+ * @dev ProofScore-weighted governance with trust-based democracy
+ * @notice Honor-based governance where trust matters more than wealth
+ */
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+
+interface IProofLedger {
+    function getProofScore(address user) external view returns (
+        uint256 trust,
+        uint256 security,
+        uint256 community,
+        uint256 loyalty,
+        uint256 activity
+    );
+    function logActivity(address user, string calldata actionType, uint256 amount) external;
+    function updateTrustMetrics(address user, uint256 newScore, string calldata reason) external;
+}
+
+interface IMultiSigDeveloperControl {
+    function isApproved(bytes32 actionHash) external view returns (bool);
+}
+
+interface ISeer {
+    function analyze(address from, address token, address to, uint256 amount, bytes32 context) 
+        external view returns (uint8 verdict, uint8 risk, bytes32 reason);
+}
+
+interface ISanctumFund {
+    function getApprovedCharities() external view returns (address[] memory);
+    function approveCharity(address charity, string calldata name) external;
+    function removeCharity(address charity) external;
+}
+
+contract DAO is Ownable, ReentrancyGuard, Pausable {
+    
+    /* ================================ CONSTANTS ================================ */
+    
+    uint256 public constant MIN_PROPOSAL_THRESHOLD = 100;     // Minimum trust score to propose
+    uint256 public constant MIN_VOTING_THRESHOLD = 50;       // Minimum trust score to vote
+    uint256 public constant QUORUM_PERCENTAGE = 15;          // 15% of eligible voters for quorum
+    uint256 public constant VOTING_PERIOD = 7 days;          // Standard voting period
+    uint256 public constant EMERGENCY_VOTING_PERIOD = 24 hours; // Emergency proposals
+    uint256 public constant EXECUTION_DELAY = 24 hours;      // Delay before execution
+    uint256 public constant MAX_PROPOSAL_DESCRIPTION = 2000; // Max chars in description
+    
+    /* ================================ ENUMS ================================ */
+    
+    enum ProposalState {
+        PENDING,        // Waiting for voting period
+        ACTIVE,         // Currently voting
+        SUCCEEDED,      // Passed vote, ready for execution
+        DEFEATED,       // Failed vote
+        EXECUTED,       // Successfully executed
+        CANCELLED,      // Cancelled by proposer or admin
+        EXPIRED,        // Execution deadline passed
+        QUEUED         // Waiting for execution delay
+    }
+    
+    enum ProposalType {
+        STANDARD,           // Regular governance proposal
+        CONSTITUTIONAL,     // Changes to core governance rules
+        EMERGENCY,          // Fast-track emergency proposals
+        TREASURY,          // Treasury management
+        PARAMETER_CHANGE,   // System parameter updates
+        CHARITY_APPROVAL,   // Sanctum Fund charity approval
+        COMMUNITY_FUND,     // Community funding decisions
+        TRUST_SYSTEM,      // Changes to trust/honor systems
+        SECURITY_UPGRADE   // Security-related upgrades
+    }
+    
+    enum VoteType {
+        FOR,
+        AGAINST,
+        ABSTAIN
+    }
+    
+    /* ================================ STRUCTS ================================ */
+    
+    struct Proposal {
+        uint256 id;
+        address proposer;
+        ProposalType proposalType;
+        string title;
+        string description;
+        bytes32 dataHash;           // Hash of proposal data
+        address[] targets;          // Addresses to call
+        uint256[] values;          // ETH values for calls
+        bytes[] calldatas;         // Function call data
+        uint256 startTime;         // Voting start time
+        uint256 endTime;           // Voting end time
+        uint256 executionTime;     // When it can be executed
+        uint256 forVotes;          // Weighted votes for
+        uint256 againstVotes;      // Weighted votes against
+        uint256 abstainVotes;      // Weighted abstain votes
+        uint256 totalVoters;       // Number of unique voters
+        bool executed;
+        bool cancelled;
+        mapping(address => bool) hasVoted;
+        mapping(address => VoteType) votes;
+        mapping(address => uint256) votingWeight;
+    }
+    
+    struct VotingRights {
+        uint256 votingWeight;      // Calculated voting weight
+        uint256 lastWeightUpdate; // When weight was last calculated
+        bool eligible;             // Eligible to vote
+        uint256 proposalsSubmitted;
+        uint256 votesSubmitted;
+        uint256 successfulProposals;
+    }
+    
+    struct GovernanceMetrics {
+        uint256 totalProposals;
+        uint256 totalVotes;
+        uint256 totalParticipants;
+        uint256 averageParticipation;
+        uint256 lastActivityTime;
+    }
+    
+    struct TrustWeighting {
+        uint256 trustWeight;       // Weight for trust score (50%)
+        uint256 securityWeight;    // Weight for security score (20%)
+        uint256 communityWeight;   // Weight for community score (15%)
+        uint256 loyaltyWeight;     // Weight for loyalty score (10%)
+        uint256 activityWeight;    // Weight for activity score (5%)
+    }
+    
+    /* ================================ STATE VARIABLES ================================ */
+    
+    // Core governance
+    mapping(uint256 => Proposal) public proposals;
+    mapping(address => VotingRights) public votingRights;
+    uint256 public proposalCount;
+    uint256 public nextProposalId = 1;
+    
+    // Governance parameters
+    uint256 public quorumNumerator = 15; // 15% quorum
+    uint256 public proposalThreshold = 100; // Min trust score for proposals
+    uint256 public votingDelay = 1 hours; // Delay before voting starts
+    mapping(ProposalType => uint256) public votingPeriods;
+    mapping(ProposalType => uint256) public executionDelays;
+    
+    // Trust-based weighting
+    TrustWeighting public trustWeighting;
+    mapping(address => uint256) public lastVotingWeightUpdate;
+    mapping(address => uint256) public cachedVotingWeight;
+    
+    // Governance tracking
+    GovernanceMetrics public metrics;
+    mapping(address => uint256[]) public userProposals;
+    mapping(address => uint256[]) public userVotes;
+    uint256[] public allProposals;
+    
+    // Emergency governance
+    bool public emergencyMode;
+    address public emergencyInitiator;
+    uint256 public emergencyActivatedAt;
+    mapping(address => bool) public emergencyCouncil;
+    
+    // Constitutional changes (requires special approval)
+    mapping(bytes32 => bool) public constitutionalRules;
+    uint256 public constitutionalQuorum = 30; // 30% for constitutional changes
+    
+    // Integration contracts
+    IERC20 public vfideToken;
+    IProofLedger public proofLedger;
+    IMultiSigDeveloperControl public multiSigControl;
+    ISeer public seer;
+    ISanctumFund public sanctumFund;
+    
+    /* ================================ EVENTS ================================ */
+    
+    // Proposal events
+    event ProposalCreated(
+        uint256 indexed proposalId,
+        address indexed proposer,
+        ProposalType proposalType,
+        string title,
+        uint256 startTime,
+        uint256 endTime
+    );
+    event ProposalStateChanged(uint256 indexed proposalId, ProposalState oldState, ProposalState newState);
+    event ProposalExecuted(uint256 indexed proposalId, address indexed executor);
+    event ProposalCancelled(uint256 indexed proposalId, address indexed canceller, string reason);
+    
+    // Voting events
+    event VoteCast(
+        uint256 indexed proposalId,
+        address indexed voter,
+        VoteType vote,
+        uint256 weight,
+        string reason
+    );
+    event VotingWeightUpdated(address indexed voter, uint256 oldWeight, uint256 newWeight);
+    event VotingRightsGranted(address indexed voter, uint256 weight);
+    event VotingRightsRevoked(address indexed voter, string reason);
+    
+    // Governance events
+    event QuorumUpdated(uint256 oldQuorum, uint256 newQuorum);
+    event GovernanceParameterUpdated(string parameter, uint256 oldValue, uint256 newValue);
+    event EmergencyModeToggled(bool active, address indexed initiator);
+    event EmergencyCouncilUpdated(address indexed member, bool added);
+    
+    // Trust events
+    event TrustWeightingUpdated(uint256[5] oldWeights, uint256[5] newWeights);
+    event ConstitutionalRuleAdded(bytes32 indexed ruleHash, string rule);
+    
+    /* ================================ MODIFIERS ================================ */
+    
+    modifier onlyEligibleVoter() {
+        require(_isEligibleVoter(msg.sender), "Not eligible to vote");
+        _;
+    }
+    
+    modifier onlyEligibleProposer() {
+        require(_isEligibleProposer(msg.sender), "Not eligible to propose");
+        _;
+    }
+    
+    modifier proposalExists(uint256 proposalId) {
+        require(proposalId > 0 && proposalId < nextProposalId, "Invalid proposal");
+        _;
+    }
+    
+    modifier onlyEmergencyCouncil() {
+        require(emergencyCouncil[msg.sender] || msg.sender == owner(), "Not emergency council member");
+        _;
+    }
+    
+    /* ================================ CONSTRUCTOR ================================ */
+    
+    constructor() Ownable() {
+        // Initialize voting periods
+        votingPeriods[ProposalType.STANDARD] = 7 days;
+        votingPeriods[ProposalType.CONSTITUTIONAL] = 14 days;
+        votingPeriods[ProposalType.EMERGENCY] = 24 hours;
+        votingPeriods[ProposalType.TREASURY] = 5 days;
+        votingPeriods[ProposalType.PARAMETER_CHANGE] = 3 days;
+        votingPeriods[ProposalType.CHARITY_APPROVAL] = 3 days;
+        votingPeriods[ProposalType.COMMUNITY_FUND] = 7 days;
+        votingPeriods[ProposalType.TRUST_SYSTEM] = 10 days;
+        votingPeriods[ProposalType.SECURITY_UPGRADE] = 7 days;
+        
+        // Initialize execution delays
+        executionDelays[ProposalType.STANDARD] = 24 hours;
+        executionDelays[ProposalType.CONSTITUTIONAL] = 48 hours;
+        executionDelays[ProposalType.EMERGENCY] = 1 hours;
+        executionDelays[ProposalType.TREASURY] = 24 hours;
+        executionDelays[ProposalType.PARAMETER_CHANGE] = 12 hours;
+        executionDelays[ProposalType.CHARITY_APPROVAL] = 6 hours;
+        executionDelays[ProposalType.COMMUNITY_FUND] = 24 hours;
+        executionDelays[ProposalType.TRUST_SYSTEM] = 48 hours;
+        executionDelays[ProposalType.SECURITY_UPGRADE] = 24 hours;
+        
+        // Initialize trust weighting (totals 100%)
+        trustWeighting = TrustWeighting({
+            trustWeight: 50,      // 50% weight for trust
+            securityWeight: 20,   // 20% weight for security
+            communityWeight: 15,  // 15% weight for community
+            loyaltyWeight: 10,    // 10% weight for loyalty
+            activityWeight: 5     // 5% weight for activity
+        });
+        
+        // Initialize constitutional rules
+        constitutionalRules[keccak256("immutable_token_supply")] = true;
+        constitutionalRules[keccak256("trust_based_governance")] = true;
+        constitutionalRules[keccak256("no_whale_dominance")] = true;
+    }
+    
+    /* ================================ PROPOSAL CREATION ================================ */
+    
+    /**
+     * @dev Create a new proposal
+     */
+    function propose(
+        ProposalType proposalType,
+        string calldata title,
+        string calldata description,
+        address[] calldata targets,
+        uint256[] calldata values,
+        bytes[] calldata calldatas
+    ) external onlyEligibleProposer whenNotPaused nonReentrant returns (uint256 proposalId) {
+        require(bytes(title).length > 0, "Title cannot be empty");
+        require(bytes(description).length <= MAX_PROPOSAL_DESCRIPTION, "Description too long");
+        require(targets.length == values.length, "Array length mismatch");
+        require(targets.length == calldatas.length, "Array length mismatch");
+        
+        // Check for emergency proposals
+        if (proposalType == ProposalType.EMERGENCY) {
+            require(emergencyMode || emergencyCouncil[msg.sender], "Emergency proposals require emergency mode");
+        }
+        
+        // Check for constitutional proposals
+        if (proposalType == ProposalType.CONSTITUTIONAL) {
+            require(_calculateVotingWeight(msg.sender) >= 500, "Insufficient trust for constitutional proposal");
+        }
+        
+        proposalId = nextProposalId++;
+        Proposal storage proposal = proposals[proposalId];
+        
+        proposal.id = proposalId;
+        proposal.proposer = msg.sender;
+        proposal.proposalType = proposalType;
+        proposal.title = title;
+        proposal.description = description;
+        proposal.dataHash = keccak256(abi.encode(targets, values, calldatas));
+        proposal.targets = targets;
+        proposal.values = values;
+        proposal.calldatas = calldatas;
+        proposal.startTime = block.timestamp + votingDelay;
+        proposal.endTime = proposal.startTime + votingPeriods[proposalType];
+        proposal.executionTime = proposal.endTime + executionDelays[proposalType];
+        
+        // Update tracking
+        allProposals.push(proposalId);
+        userProposals[msg.sender].push(proposalId);
+        votingRights[msg.sender].proposalsSubmitted++;
+        metrics.totalProposals++;
+        proposalCount++;
+        
+        emit ProposalCreated(proposalId, msg.sender, proposalType, title, proposal.startTime, proposal.endTime);
+        emit ProposalStateChanged(proposalId, ProposalState.PENDING, ProposalState.PENDING);
+        
+        // Log in ProofLedger
+        if (address(proofLedger) != address(0)) {
+            try proofLedger.logActivity(msg.sender, "governance_proposal", uint256(proposalType)) {} catch {}
+        }
+        
+        return proposalId;
+    }
+    
+    /* ================================ VOTING SYSTEM ================================ */
+    
+    /**
+     * @dev Cast a vote on a proposal
+     */
+    function castVote(
+        uint256 proposalId,
+        VoteType vote,
+        string calldata reason
+    ) external onlyEligibleVoter proposalExists(proposalId) whenNotPaused nonReentrant {
+        require(_getProposalState(proposalId) == ProposalState.ACTIVE, "Voting not active");
+        
+        Proposal storage proposal = proposals[proposalId];
+        require(!proposal.hasVoted[msg.sender], "Already voted");
+        
+        uint256 weight = _getUpdatedVotingWeight(msg.sender);
+        require(weight > 0, "No voting weight");
+        
+        proposal.hasVoted[msg.sender] = true;
+        proposal.votes[msg.sender] = vote;
+        proposal.votingWeight[msg.sender] = weight;
+        proposal.totalVoters++;
+        
+        // Apply vote weight
+        if (vote == VoteType.FOR) {
+            proposal.forVotes += weight;
+        } else if (vote == VoteType.AGAINST) {
+            proposal.againstVotes += weight;
+        } else {
+            proposal.abstainVotes += weight;
+        }
+        
+        // Update user tracking
+        userVotes[msg.sender].push(proposalId);
+        votingRights[msg.sender].votesSubmitted++;
+        metrics.totalVotes++;
+        
+        emit VoteCast(proposalId, msg.sender, vote, weight, reason);
+        
+        // Log in ProofLedger
+        if (address(proofLedger) != address(0)) {
+            try proofLedger.logActivity(msg.sender, "governance_vote", weight) {} catch {}
+        }
+        
+        // Update governance metrics
+        _updateGovernanceMetrics();
+    }
+    
+    /**
+     * @dev Cast multiple votes in a single transaction
+     */
+    function castVoteBatch(
+        uint256[] calldata proposalIds,
+        VoteType[] calldata votes,
+        string[] calldata reasons
+    ) external onlyEligibleVoter whenNotPaused nonReentrant {
+        require(proposalIds.length == votes.length, "Array length mismatch");
+        require(proposalIds.length == reasons.length, "Array length mismatch");
+        require(proposalIds.length <= 10, "Too many proposals");
+        
+        for (uint256 i = 0; i < proposalIds.length; i++) {
+            this.castVote(proposalIds[i], votes[i], reasons[i]);
+        }
+    }
+    
+    /* ================================ PROPOSAL EXECUTION ================================ */
+    
+    /**
+     * @dev Execute a successful proposal
+     */
+    function execute(uint256 proposalId) 
+        external 
+        proposalExists(proposalId) 
+        whenNotPaused 
+        nonReentrant 
+    {
+        require(_getProposalState(proposalId) == ProposalState.SUCCEEDED, "Proposal not ready for execution");
+        
+        Proposal storage proposal = proposals[proposalId];
+        require(block.timestamp >= proposal.executionTime, "Execution delay not passed");
+        require(!proposal.executed, "Already executed");
+        
+        // Constitutional proposals need multi-sig approval
+        if (proposal.proposalType == ProposalType.CONSTITUTIONAL) {
+            if (address(multiSigControl) != address(0)) {
+                bytes32 actionHash = keccak256(abi.encodePacked("execute_constitutional", proposalId));
+                require(multiSigControl.isApproved(actionHash), "Multi-sig approval required");
+            }
+        }
+        
+        proposal.executed = true;
+        
+        // Execute all calls
+        bool allSucceeded = true;
+        for (uint256 i = 0; i < proposal.targets.length; i++) {
+            (bool success,) = proposal.targets[i].call{value: proposal.values[i]}(proposal.calldatas[i]);
+            if (!success) {
+                allSucceeded = false;
+            }
+        }
+        
+        require(allSucceeded, "Execution failed");
+        
+        // Update proposer's success rate
+        votingRights[proposal.proposer].successfulProposals++;
+        
+        emit ProposalExecuted(proposalId, msg.sender);
+        emit ProposalStateChanged(proposalId, ProposalState.SUCCEEDED, ProposalState.EXECUTED);
+        
+        // Award trust points to proposer
+        if (address(proofLedger) != address(0)) {
+            try proofLedger.logActivity(proposal.proposer, "successful_proposal", 1) {} catch {}
+        }
+        
+        // Update governance metrics
+        _updateGovernanceMetrics();
+    }
+    
+    /**
+     * @dev Cancel a proposal (proposer or admin only)
+     */
+    function cancel(uint256 proposalId, string calldata reason) 
+        external 
+        proposalExists(proposalId) 
+    {
+        Proposal storage proposal = proposals[proposalId];
+        require(
+            msg.sender == proposal.proposer || 
+            msg.sender == owner() || 
+            emergencyCouncil[msg.sender],
+            "Not authorized to cancel"
+        );
+        
+        ProposalState state = _getProposalState(proposalId);
+        require(
+            state == ProposalState.PENDING || 
+            state == ProposalState.ACTIVE || 
+            state == ProposalState.SUCCEEDED,
+            "Cannot cancel in current state"
+        );
+        
+        proposal.cancelled = true;
+        
+        emit ProposalCancelled(proposalId, msg.sender, reason);
+        emit ProposalStateChanged(proposalId, state, ProposalState.CANCELLED);
+    }
+    
+    /* ================================ VOTING WEIGHT CALCULATION ================================ */
+    
+    /**
+     * @dev Calculate voting weight based on ProofScore
+     */
+    function _calculateVotingWeight(address voter) internal view returns (uint256) {
+        if (address(proofLedger) == address(0)) {
+            return 100; // Default weight if no ProofLedger
+        }
+        
+        try proofLedger.getProofScore(voter) returns (
+            uint256 trust,
+            uint256 security,
+            uint256 community,
+            uint256 loyalty,
+            uint256 activity
+        ) {
+            // Apply trust-based weighting
+            uint256 weightedScore = (
+                trust * trustWeighting.trustWeight +
+                security * trustWeighting.securityWeight +
+                community * trustWeighting.communityWeight +
+                loyalty * trustWeighting.loyaltyWeight +
+                activity * trustWeighting.activityWeight
+            ) / 100;
+            
+            // Apply token balance bonus (small influence)
+            uint256 tokenBonus = 0;
+            if (address(vfideToken) != address(0)) {
+                uint256 balance = vfideToken.balanceOf(voter);
+                tokenBonus = balance / 10000e18; // 1 point per 10k tokens
+                if (tokenBonus > 100) tokenBonus = 100; // Cap at 100 points
+            }
+            
+            uint256 totalWeight = weightedScore + tokenBonus;
+            
+            // Ensure minimum and maximum weights
+            if (totalWeight < 1) totalWeight = 1;
+            if (totalWeight > 2000) totalWeight = 2000; // Cap at 2000
+            
+            return totalWeight;
+            
+        } catch {
+            return 100; // Default if ProofScore fails
+        }
+    }
+    
+    /**
+     * @dev Get updated voting weight (with caching)
+     */
+    function _getUpdatedVotingWeight(address voter) internal returns (uint256) {
+        // Cache voting weight for 24 hours
+        if (block.timestamp > lastVotingWeightUpdate[voter] + 86400) {
+            uint256 oldWeight = cachedVotingWeight[voter];
+            uint256 newWeight = _calculateVotingWeight(voter);
+            
+            cachedVotingWeight[voter] = newWeight;
+            lastVotingWeightUpdate[voter] = block.timestamp;
+            
+            if (oldWeight != newWeight) {
+                emit VotingWeightUpdated(voter, oldWeight, newWeight);
+            }
+            
+            return newWeight;
+        }
+        
+        return cachedVotingWeight[voter];
+    }
+    
+    /* ================================ ELIGIBILITY CHECKS ================================ */
+    
+    /**
+     * @dev Check if address is eligible to vote
+     */
+    function _isEligibleVoter(address voter) internal view returns (bool) {
+        if (address(proofLedger) == address(0)) return true;
+        
+        try proofLedger.getProofScore(voter) returns (
+            uint256 trust,
+            uint256 security,
+            uint256, uint256, uint256
+        ) {
+            return trust >= MIN_VOTING_THRESHOLD && security >= 25;
+        } catch {
+            return false;
+        }
+    }
+    
+    /**
+     * @dev Check if address is eligible to propose
+     */
+    function _isEligibleProposer(address proposer) internal view returns (bool) {
+        if (address(proofLedger) == address(0)) return true;
+        
+        try proofLedger.getProofScore(proposer) returns (
+            uint256 trust,
+            uint256 security,
+            uint256 community,
+            uint256, uint256
+        ) {
+            return trust >= MIN_PROPOSAL_THRESHOLD && 
+                   security >= 50 && 
+                   community >= 25;
+        } catch {
+            return false;
+        }
+    }
+    
+    /* ================================ PROPOSAL STATE MANAGEMENT ================================ */
+    
+    /**
+     * @dev Get current proposal state
+     */
+    function _getProposalState(uint256 proposalId) internal view returns (ProposalState) {
+        Proposal storage proposal = proposals[proposalId];
+        
+        if (proposal.cancelled) {
+            return ProposalState.CANCELLED;
+        }
+        
+        if (proposal.executed) {
+            return ProposalState.EXECUTED;
+        }
+        
+        if (block.timestamp < proposal.startTime) {
+            return ProposalState.PENDING;
+        }
+        
+        if (block.timestamp <= proposal.endTime) {
+            return ProposalState.ACTIVE;
+        }
+        
+        // Voting period ended - check results
+        uint256 totalVotes = proposal.forVotes + proposal.againstVotes + proposal.abstainVotes;
+        uint256 requiredQuorum = _getRequiredQuorum(proposal.proposalType);
+        
+        if (totalVotes < requiredQuorum) {
+            return ProposalState.DEFEATED;
+        }
+        
+        // Check if proposal passed
+        if (proposal.forVotes > proposal.againstVotes) {
+            if (block.timestamp >= proposal.executionTime + 30 days) {
+                return ProposalState.EXPIRED; // Expired if not executed within 30 days
+            }
+            if (block.timestamp >= proposal.executionTime) {
+                return ProposalState.SUCCEEDED;
+            }
+            return ProposalState.QUEUED;
+        } else {
+            return ProposalState.DEFEATED;
+        }
+    }
+    
+    /**
+     * @dev Get required quorum for proposal type
+     */
+    function _getRequiredQuorum(ProposalType proposalType) internal view returns (uint256) {
+        uint256 eligibleVoters = _getEligibleVoterCount();
+        uint256 baseQuorum = (eligibleVoters * quorumNumerator) / 100;
+        
+        if (proposalType == ProposalType.CONSTITUTIONAL) {
+            return (eligibleVoters * constitutionalQuorum) / 100;
+        }
+        if (proposalType == ProposalType.EMERGENCY) {
+            return baseQuorum / 2; // Lower quorum for emergency
+        }
+        if (proposalType == ProposalType.TRUST_SYSTEM) {
+            return (eligibleVoters * 25) / 100; // Higher quorum for trust changes
+        }
+        
+        return baseQuorum;
+    }
+    
+    /**
+     * @dev Get eligible voter count
+     */
+    function _getEligibleVoterCount() internal view returns (uint256) {
+        // This would need to be tracked or calculated
+        // For now, return a reasonable estimate
+        return 1000; // Could be calculated based on ProofScore thresholds
+    }
+    
+    /* ================================ GOVERNANCE METRICS ================================ */
+    
+    /**
+     * @dev Update governance metrics
+     */
+    function _updateGovernanceMetrics() internal {
+        metrics.lastActivityTime = block.timestamp;
+        
+        // Calculate average participation over last 10 proposals
+        if (allProposals.length >= 10) {
+            uint256 totalParticipation = 0;
+            uint256 proposalsToCheck = 10;
+            
+            for (uint256 i = allProposals.length - proposalsToCheck; i < allProposals.length; i++) {
+                totalParticipation += proposals[allProposals[i]].totalVoters;
+            }
+            
+            metrics.averageParticipation = totalParticipation / proposalsToCheck;
+        }
+    }
+    
+    /* ================================ EMERGENCY GOVERNANCE ================================ */
+    
+    /**
+     * @dev Activate emergency governance mode
+     */
+    function activateEmergencyMode(string calldata reason) external onlyEmergencyCouncil {
+        require(!emergencyMode, "Emergency mode already active");
+        
+        emergencyMode = true;
+        emergencyInitiator = msg.sender;
+        emergencyActivatedAt = block.timestamp;
+        
+        emit EmergencyModeToggled(true, msg.sender);
+        
+        // Log in ProofLedger
+        if (address(proofLedger) != address(0)) {
+            try proofLedger.logActivity(msg.sender, "emergency_governance", 1) {} catch {}
+        }
+    }
+    
+    /**
+     * @dev Deactivate emergency governance mode
+     */
+    function deactivateEmergencyMode() external onlyEmergencyCouncil {
+        require(emergencyMode, "Emergency mode not active");
+        
+        emergencyMode = false;
+        emergencyInitiator = address(0);
+        emergencyActivatedAt = 0;
+        
+        emit EmergencyModeToggled(false, msg.sender);
+    }
+    
+    /**
+     * @dev Add emergency council member
+     */
+    function addEmergencyCouncilMember(address member) external onlyOwner {
+        require(member != address(0), "Invalid member address");
+        emergencyCouncil[member] = true;
+        emit EmergencyCouncilUpdated(member, true);
+    }
+    
+    /**
+     * @dev Remove emergency council member
+     */
+    function removeEmergencyCouncilMember(address member) external onlyOwner {
+        emergencyCouncil[member] = false;
+        emit EmergencyCouncilUpdated(member, false);
+    }
+    
+    /* ================================ VIEW FUNCTIONS ================================ */
+    
+    /**
+     * @dev Get proposal details
+     */
+    function getProposal(uint256 proposalId) external view returns (
+        address proposer,
+        ProposalType proposalType,
+        string memory title,
+        string memory description,
+        uint256 startTime,
+        uint256 endTime,
+        uint256 forVotes,
+        uint256 againstVotes,
+        uint256 abstainVotes,
+        ProposalState state
+    ) {
+        Proposal storage proposal = proposals[proposalId];
+        return (
+            proposal.proposer,
+            proposal.proposalType,
+            proposal.title,
+            proposal.description,
+            proposal.startTime,
+            proposal.endTime,
+            proposal.forVotes,
+            proposal.againstVotes,
+            proposal.abstainVotes,
+            _getProposalState(proposalId)
+        );
+    }
+    
+    /**
+     * @dev Get voting weight for address
+     */
+    function getVotingWeight(address voter) external view returns (uint256) {
+        return _calculateVotingWeight(voter);
+    }
+    
+    /**
+     * @dev Check if address has voted on proposal
+     */
+    function hasVoted(uint256 proposalId, address voter) external view returns (bool) {
+        return proposals[proposalId].hasVoted[voter];
+    }
+    
+    /**
+     * @dev Get vote details for voter on proposal
+     */
+    function getVote(uint256 proposalId, address voter) external view returns (
+        bool hasVotedFlag,
+        VoteType vote,
+        uint256 weight
+    ) {
+        Proposal storage proposal = proposals[proposalId];
+        return (
+            proposal.hasVoted[voter],
+            proposal.votes[voter],
+            proposal.votingWeight[voter]
+        );
+    }
+    
+    /**
+     * @dev Get user's governance statistics
+     */
+    function getUserGovernanceStats(address user) external view returns (
+        uint256 proposalsSubmitted,
+        uint256 votesSubmitted,
+        uint256 successfulProposals,
+        uint256 currentVotingWeight,
+        bool isEligibleVoter,
+        bool isEligibleProposer
+    ) {
+        VotingRights storage rights = votingRights[user];
+        return (
+            rights.proposalsSubmitted,
+            rights.votesSubmitted,
+            rights.successfulProposals,
+            _calculateVotingWeight(user),
+            _isEligibleVoter(user),
+            _isEligibleProposer(user)
+        );
+    }
+    
+    /**
+     * @dev Get governance metrics
+     */
+    function getGovernanceMetrics() external view returns (GovernanceMetrics memory) {
+        return metrics;
+    }
+    
+    /**
+     * @dev Get all proposals (paginated)
+     */
+    function getProposals(uint256 offset, uint256 limit) external view returns (uint256[] memory) {
+        require(offset < allProposals.length, "Offset out of bounds");
+        
+        uint256 end = offset + limit;
+        if (end > allProposals.length) {
+            end = allProposals.length;
+        }
+        
+        uint256[] memory result = new uint256[](end - offset);
+        for (uint256 i = offset; i < end; i++) {
+            result[i - offset] = allProposals[i];
+        }
+        
+        return result;
+    }
+    
+    /* ================================ ADMIN FUNCTIONS ================================ */
+    
+    /**
+     * @dev Set integration contracts
+     */
+    function setContracts(
+        address _vfideToken,
+        address _proofLedger,
+        address _multiSigControl,
+        address _seer,
+        address _sanctumFund
+    ) external onlyOwner {
+        vfideToken = IERC20(_vfideToken);
+        proofLedger = IProofLedger(_proofLedger);
+        multiSigControl = IMultiSigDeveloperControl(_multiSigControl);
+        seer = ISeer(_seer);
+        sanctumFund = ISanctumFund(_sanctumFund);
+    }
+    
+    /**
+     * @dev Update trust weighting
+     */
+    function updateTrustWeighting(
+        uint256 _trustWeight,
+        uint256 _securityWeight,
+        uint256 _communityWeight,
+        uint256 _loyaltyWeight,
+        uint256 _activityWeight
+    ) external onlyOwner {
+        require(_trustWeight + _securityWeight + _communityWeight + _loyaltyWeight + _activityWeight == 100, "Weights must sum to 100");
+        
+        uint256[5] memory oldWeights = [
+            trustWeighting.trustWeight,
+            trustWeighting.securityWeight,
+            trustWeighting.communityWeight,
+            trustWeighting.loyaltyWeight,
+            trustWeighting.activityWeight
+        ];
+        
+        trustWeighting.trustWeight = _trustWeight;
+        trustWeighting.securityWeight = _securityWeight;
+        trustWeighting.communityWeight = _communityWeight;
+        trustWeighting.loyaltyWeight = _loyaltyWeight;
+        trustWeighting.activityWeight = _activityWeight;
+        
+        uint256[5] memory newWeights = [_trustWeight, _securityWeight, _communityWeight, _loyaltyWeight, _activityWeight];
+        
+        emit TrustWeightingUpdated(oldWeights, newWeights);
+    }
+    
+    /**
+     * @dev Update governance parameters
+     */
+    function updateGovernanceParameter(string calldata parameter, uint256 newValue) external onlyOwner {
+        bytes32 paramHash = keccak256(abi.encodePacked(parameter));
+        uint256 oldValue;
+        
+        if (paramHash == keccak256("quorumNumerator")) {
+            require(newValue >= 5 && newValue <= 50, "Invalid quorum");
+            oldValue = quorumNumerator;
+            quorumNumerator = newValue;
+        } else if (paramHash == keccak256("proposalThreshold")) {
+            require(newValue >= 50 && newValue <= 500, "Invalid threshold");
+            oldValue = proposalThreshold;
+            proposalThreshold = newValue;
+        } else if (paramHash == keccak256("votingDelay")) {
+            require(newValue >= 1 hours && newValue <= 7 days, "Invalid delay");
+            oldValue = votingDelay;
+            votingDelay = newValue;
+        } else if (paramHash == keccak256("constitutionalQuorum")) {
+            require(newValue >= 25 && newValue <= 75, "Invalid constitutional quorum");
+            oldValue = constitutionalQuorum;
+            constitutionalQuorum = newValue;
+        } else {
+            revert("Unknown parameter");
+        }
+        
+        emit GovernanceParameterUpdated(parameter, oldValue, newValue);
+    }
+    
+    /**
+     * @dev Add constitutional rule
+     */
+    function addConstitutionalRule(string calldata rule) external onlyOwner {
+        bytes32 ruleHash = keccak256(abi.encodePacked(rule));
+        constitutionalRules[ruleHash] = true;
+        emit ConstitutionalRuleAdded(ruleHash, rule);
+    }
+    
+    /**
+     * @dev Emergency pause
+     */
+    function emergencyPause() external onlyOwner {
+        _pause();
+    }
+    
+    /**
+     * @dev Emergency unpause
+     */
+    function emergencyUnpause() external onlyOwner {
+        _unpause();
+    }
+}
