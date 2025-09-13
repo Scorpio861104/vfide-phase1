@@ -1,34 +1,29 @@
-name: CI
+name: Hardhat CI
 
 on:
   push:
+    branches: [ main ]
   pull_request:
+    branches: [ main ]
 
 jobs:
-  build-and-test:
+  test:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v3
 
-      - name: Debug: list files
-        run: |
-          pwd
-          ls -la
-          echo "-----"
-          ls -la .github/workflows || true
-          echo "-----"
-          ls -R contracts || true
-          echo "-----"
-          ls -R test || true
-
-      - uses: actions/setup-node@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
         with:
-          node-version: 20
+          node-version: 18
 
-      # Use npm install since we don't have a lockfile yet.
-      - name: Install deps
-        run: npm install --no-audit --no-fund
+      - name: Install dependencies
+        run: npm install
 
-      - run: npm run lint:sol
-      - run: npm run build
-      - run: npm test
+      - name: Compile contracts
+        run: npx hardhat compile
+
+      - name: Run tests
+        run: npx hardhat test
